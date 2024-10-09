@@ -1,1 +1,748 @@
-cc
+
+# Load necessary libraries
+library(imager)
+library(pixmap)
+library(wvtool)
+
+
+
+# Set paths to your image folders for target and non-target emotions
+target_emotion_folder <- "C:/Users/emily/Documents/Face data final exam AUD/Target"
+non_target_emotion_folder <- "C:/Users/emily/Documents/Face data final exam AUD/Non-target"
+
+
+# Function to load images from a folder
+load_images <- function(folder_path) {
+  # List all image files in the folder
+  image_files <- list.files(folder_path, full.names = TRUE, pattern = "\\.(png)$", recursive = TRUE)
+  # Load images using imager::load.image
+  images <- lapply(image_files, function(path) load.image(path))
+  return(images)
+}
+
+# Load images from target and non-target emotion folders
+target_images <- load_images(target_emotion_folder)
+non_target_images <- load_images(non_target_emotion_folder)
+
+# Combine the images, keeping the target images first
+all_images <- c(target_images, non_target_images)
+
+plot(all_images[[1]])
+
+
+# Step 8: 
+# Canny edge detection
+edges <- lapply(all_images, cannyEdges)
+plot(edges[[1]])
+
+# Detect lines via Hough detection
+lines <- lapply(edges, hough_line, ntheta = 800)
+plot(lines[[1]])
+
+# create dataframes for every image
+lines_df <- lapply(edges, hough_line, ntheta = 800, data.frame = TRUE)
+# Initialize a vector to store the count of important lines for each image
+important_lines_counts <- numeric(length(lines_df))
+# Loop through each dataframe in the list
+for (i in seq_along(lines_df)) {
+  # Extract the current dataframe
+  current_df <- lines_df[[i]]
+  # extract the scores
+  scores <- current_df$score
+  # Determine the .995th percentile threshold for scores
+  score_threshold <- quantile(scores, .995)
+  # Count lines with score above or equal to the threshold
+  important_lines_counts[i] <- sum(scores >= score_threshold)
+}
+
+
+
+# create matrix for Gabor filter
+all_images_matrix <- lapply(all_images, function(x)
+  as.matrix(x[,,1,1]))
+# set Parameters (reduced amount of combinations to reduce computation time)
+lamdas <- seq(2, 10, by = 2)
+thetas <- seq(0, 180, by = 45)
+bws <- seq(1, 4, by = 1)
+# Initialize an empty list to hold feature matrices for each image
+image_features_list <- list()
+# Loop through each image
+for (i in 1:length(all_images_matrix)) {
+  image <- all_images_matrix[[i]]
+  # Initialize an empty matrix for this image's features: rows = combinations, columns = mean & sd
+  num_combinations <- length(lamdas) * length(thetas) * length(bws)
+  features_matrix <- matrix(nrow = num_combinations, ncol = 2)
+  # 2 for mean and sd
+  row.names(features_matrix) <- paste("Combination",
+                                      1:num_combinations)
+  colnames(features_matrix) <- c("Mean", "SD")
+  # Counter for filling in the features_matrix
+  count <- 1
+  # Loop through each combination of parameters
+  for (lamda in lamdas) {
+    for (theta in thetas) {
+      for (bw in bws) {
+        # Apply Gabor filter
+        result <- gabor.filter(image, lamda = lamda,
+                               theta = theta , bw = bw)
+        
+        # Calculate mean and standard deviation
+        features_matrix[count, "Mean"] <-
+          mean(result$filtered_img)
+        features_matrix[count, "SD"] <-
+          sd(result$filtered_img)
+        count <- count + 1
+      }
+    }
+  }
+  # Append the features matrix to the list
+  image_features_list[[i]] <- features_matrix
+}
+
+
+# Number of images
+num_images <- length(image_features_list)
+# Total number of features per image (mean + sd for each combination)
+num_features <- nrow(image_features_list[[1]]) *
+  ncol(image_features_list[[1]])
+# Pre-allocate matrix to store flattened features for all images
+flattened_features <- matrix(nrow = num_images, ncol = num_features)
+# Flatten each image's features into a single row
+for (i in 1:num_images) {
+  # Stack mean and SD values side by side for each combination
+  flattened_features[i, ] <- c(t(image_features_list[[i]]))
+}
+# Generate column names for the flattened features
+feature_names <- c(sapply(1:(num_features / 2), function(x)
+  paste("Combination", x, c("Mean", "SD"), sep = "_")))
+# Convert to a dataframe for easier combination with labels dataframe
+flattened_features_df <- as.data.frame(flattened_features)
+colnames(flattened_features_df) <- feature_names
+
+
+
+
+# Set parameters for the Gabor filter
+lambda <- 8
+theta <- 10  # Initial theta
+bw <- 1.5
+phi <- 0
+asp <- 0.3
+
+# Initialize the filtered image
+filt_img <- matrix(0, nrow = dim(all_images_matrix[[1]])[1], ncol = dim(all_images_matrix[[1]])[2])
+
+# Apply Gabor filter to the first image
+for (theta_val in seq(10, 180, 10)) {
+  # Apply filter
+  out <- gabor.filter(x = all_images_matrix[[1]], lamda = lambda, theta = theta_val, bw = bw, phi = phi, asp = asp)
+  # Combine the filtered images
+  filt_img <- out$filtered_img + filt_img
+}
+
+# Set up the plotting layout
+par(mfrow = c(1, 2))
+
+# Plot the original image
+plot(all_images[[1]], axes = FALSE, main = "Original Image")
+
+# Plot the filtered image
+image(rot90c(filt_img), col = gray(c(0:255)/255), asp = 1, axes = FALSE, main = "Filtered Image", useRaster = TRUE)
+
+
+
+
+
+# reload the loadings from step 7 and add to teh dataframe
+eigenvector_loadings <- read.csv("eigenface_loadings.csv") # Adjust file path
+
+# create a vector for disgust
+disgust <- rep(c(1, 0), c(200, 200))
+
+
+# Create a dataframe with the important features for modelling
+feature_df <- data.frame(Important_Lines_Count = important_lines_counts,
+                         Gabor_features = flattened_features_df,
+                         Eigenvector_Loadings <- eigenvector_loadings,
+                         Disgust = disgust,
+                         stringsAsFactors = FALSE)
+
+
+# Save the dataframe as a CSV file
+write.csv(feature_df, file = "feature_df2.csv", row.names = FALSE)
+
+library(caret)
+library(ggplot2)
+library(lattice)
+library(e1071)
+library(MLmetrics)
+
+final_df <- read.csv("feature_df2.csv")
+
+
+
+# Shuffling the feature data frame
+set.seed(123)
+
+# Generate a vector of shuffled row indices
+shuffled_df <- sample(nrow(final_df))
+
+
+# Shuffle the rows of the data frame
+features <- final_df[shuffled_df, ]
+# Creating a dataset with Disgust emotion and loadings
+features_loadings <- features[,170:286]
+# Creating a dataset with Disgust emotion and algorithmic features
+features_algorithmic <- cbind(features$Disgust, features[1:169])
+
+
+
+# Step 10: Classification model to predict disgust 
+
+# Split all 3 dataset into training and validation samples
+train_indices <- createDataPartition(y = features$Disgust, p = 0.8, list = FALSE)
+
+# Create training and validation datasets
+train_data <- features[train_indices,]
+test_data <- features[-train_indices,]
+
+train_loadings <- features_loadings[train_indices, ]
+test_loadings <- features_loadings[-train_indices, ]
+
+train_algorithmic <- features_algorithmic[train_indices,]
+test_algorithmic <- features_algorithmic[-train_indices,]
+
+
+
+# First model: SVM
+#SVM all features
+# Train an SVM model 
+svm_allfeatures <- svm(Disgust ~ ., data = train_data, 
+                       type = 'C-classification', kernel = 'radial') 
+summary(svm_allfeatures) 
+
+
+# Predict on train and test set 
+prediction_svm_allfeatures_train <- predict(svm_allfeatures, train_data) 
+prediction_svm_allfeatures_test <- predict(svm_allfeatures, test_data) 
+
+
+# Evaluate  predictions with kernel on train data
+accuracy_svm_allfeatures <- Accuracy(prediction_svm_allfeatures_train, 
+                                     train_data$Disgust) 
+
+recall_svm_allfeatures <- Recall(prediction_svm_allfeatures_train, 
+                                 train_data$Disgust) 
+
+f1_svm_allfeatures <- F1_Score(prediction_svm_allfeatures_train, 
+                               train_data$Disgust) 
+
+# Evaluate predictions with kernel on test data
+accuracy_svm_allfeatures_test <- Accuracy(prediction_svm_allfeatures_test, 
+                                     test_data$Disgust) 
+
+recall_svm_allfeatures_test <- Recall(prediction_svm_allfeatures_test, 
+                                 test_data$Disgust) 
+
+f1_svm_allfeatures_test <- F1_Score(prediction_svm_allfeatures_test, 
+                               test_data$Disgust) 
+
+# resut train 
+print(accuracy_svm_allfeatures) # 0.84
+print(recall_svm_allfeatures) # 0.85
+print(f1_svm_allfeatures) # 0.84
+
+# result test
+print(accuracy_svm_allfeatures_test) #0.57
+print(recall_svm_allfeatures_test) #0.57
+print(f1_svm_allfeatures_test)#0.56
+
+
+#SVM loadings
+# Train an SVM model 
+svm_loadings <- svm(Disgust ~ ., data = train_loadings, 
+                    type = 'C-classification', kernel = 'radial') 
+summary(svm_loadings) 
+
+
+# Predict on test set 
+pred_loadings <- predict(svm_loadings, train_loadings) 
+pred_loadings_test <- predict(svm_loadings, test_loadings) 
+
+# Evaluate predictions with kernel on train
+accuracy_svm_loadings <- Accuracy(pred_loadings, 
+                                       train_loadings$Disgust) 
+
+recall_svm_loadings <- Recall(pred_loadings, 
+                                   train_loadings$Disgust) 
+
+f1_svm_loadings <- F1_Score(pred_loadings, 
+                                 train_loadings$Disgust)
+
+# Evaluate predictions with kernel on test
+accuracy_svm_loadings_test <- Accuracy(pred_loadings_test, 
+                                  test_loadings$Disgust) 
+
+recall_svm_loadings_test <- Recall(pred_loadings_test, 
+                              test_loadings$Disgust) 
+
+f1_svm_loadings_test <- F1_Score(pred_loadings_test, 
+                            test_loadings$Disgust) 
+
+
+
+# result train
+print(accuracy_svm_loadings) #0.94
+print(recall_svm_loadings) #0.96
+print(f1_svm_loadings) #0.94
+
+# result test
+print(accuracy_svm_loadings_test) #0.61
+print(recall_svm_loadings_test) #0.61
+print(f1_svm_loadings_test) #0.60
+
+
+#SVM algorithmic
+# Train an SVM model 
+svm_algorithmic <- svm(`features$Disgust` ~ ., data = train_algorithmic, 
+                       type = 'C-classification', kernel = 'radial') 
+summary(svm_algorithmic) 
+
+
+# Predict on test set 
+pred_algorithmic <- predict(svm_algorithmic, train_algorithmic) 
+pred_algorithmic_test <- predict(svm_algorithmic, test_algorithmic) 
+
+
+# Evaluate predictions with kernel train
+accuracy_svm_algorithmic_train <- Accuracy(pred_algorithmic, 
+                                     train_algorithmic$`features$Disgust`) 
+
+recall_svm_algorithmic_train <- Recall(pred_algorithmic, 
+                                 train_algorithmic$`features$Disgust`) 
+
+f1_svm_algorithmic_train <- F1_Score(pred_algorithmic, 
+                               train_algorithmic$`features$Disgust`) 
+
+
+# Evaluate predictions with kernel test
+accuracy_svm_algorithmic <- Accuracy(pred_algorithmic_test, 
+                                     test_algorithmic$`features$Disgust`) 
+
+recall_svm_algorithmic <- Recall(pred_algorithmic_test, 
+                                 test_algorithmic$`features$Disgust`) 
+
+f1_svm_algorithmic <- F1_Score(pred_algorithmic_test, 
+                               test_algorithmic$`features$Disgust`) 
+
+
+# result train
+print(accuracy_svm_algorithmic_train) 
+print(recall_svm_algorithmic_train) 
+print(f1_svm_algorithmic_train)
+
+# result test 
+print(accuracy_svm_algorithmic) 
+print(recall_svm_algorithmic) 
+print(f1_svm_algorithmic) 
+
+
+# Overall, the models that only take into account bad quality of face, some rotations, some pictures have letters, some are not real, 
+
+
+
+
+# second model: logistic regression
+
+#Logistic regression all features
+# Train regression model
+reg_allfeatures <- glm(train_data$Disgust ~ ., data = train_data[,-286], family = binomial)
+
+# Print model summary
+summary(reg_allfeatures)
+
+# Predict on train set 
+pred_reg__allfeatures_probabilities_train <- predict(reg_allfeatures, newdata = train_data[, -286], type = "response")
+
+# Predict on test set 
+pred_reg__allfeatures_probabilities_test <- predict(reg_allfeatures, newdata = test_data[, -286], type = "response")
+
+# Convert predicted probabilities for train set to predicted class labels
+pred_reg_allfeatures_train <- ifelse(pred_reg__allfeatures_probabilities_train > 0.5, 1, 0)
+
+# Convert predicted probabilities for test set to predicted class labels
+pred_reg_allfeatures_test <- ifelse(pred_reg__allfeatures_probabilities_test > 0.5, 1, 0)
+
+
+# Accuracy on train set
+accuracy_reg_allfeatures_train <- Accuracy(pred_reg_allfeatures_train, 
+                                           train_data$Disgust) 
+# Accuracy on test set
+accuracy_reg_allfeatures_test <- Accuracy(pred_reg_allfeatures_test, 
+                                          test_data$Disgust) 
+# Recall on train set
+recall_reg_allfeatures_train <- Recall(pred_reg_allfeatures_train, 
+                                       train_data$Disgust) 
+
+# Recall on test set
+recall_reg_allfeatures_test <- Recall(pred_reg_allfeatures_test, 
+                                      test_data$Disgust) 
+# F1 score on train set
+f1_reg_allfeatures_train <- F1_Score(pred_reg_allfeatures_train, 
+                                     train_data$Disgust) 
+# F1 score on test set
+f1_reg_allfeatures_test <- F1_Score(pred_reg_allfeatures_test, 
+                                    test_data$Disgust) 
+
+
+# Print results
+# Train set
+print(accuracy_reg_allfeatures_train)
+print(recall_reg_allfeatures_train) 
+print(f1_reg_allfeatures_train)
+# Test set
+print(accuracy_reg_allfeatures_test)
+print(recall_reg_allfeatures_test) 
+print(f1_reg_allfeatures_test)
+
+
+
+
+
+#Logistic regression loadings
+# Train regression model
+reg_loadings <- glm(train_loadings$Disgust ~ ., data = train_loadings[,-286], family = binomial)
+
+# Print model summary
+summary(reg_loadings)
+
+# Predict on train set 
+pred_reg__loadings_probabilities_train <- predict(reg_loadings, newdata = train_loadings[, -286], type = "response")
+
+# Predict on test set 
+pred_reg__loadings_probabilities_test <- predict(reg_loadings, newdata = test_loadings[, -286], type = "response")
+
+# Convert predicted probabilities for train set to predicted class labels
+pred_reg_loadings_train <- ifelse(pred_reg__loadings_probabilities_train > 0.5, 1, 0)
+
+# Convert predicted probabilities for test set to predicted class labels
+pred_reg_loadings_test <- ifelse(pred_reg__loadings_probabilities_test > 0.5, 1, 0)
+
+
+# Accuracy on train set
+accuracy_reg_loadings_train <- Accuracy(pred_reg_loadings_train, 
+                                           train_loadings$Disgust) 
+# Accuracy on test set
+accuracy_reg_loadings_test <- Accuracy(pred_reg_loadings_test, 
+                                          test_loadings$Disgust) 
+# Recall on train set
+recall_reg_loadings_train <- Recall(pred_reg_loadings_train, 
+                                       train_loadings$Disgust) 
+
+# Recall on test set
+recall_reg_loadings_test <- Recall(pred_reg_loadings_test, 
+                                      test_loadings$Disgust) 
+# F1 score on train set
+f1_reg_loadings_train <- F1_Score(pred_reg_loadings_train, 
+                                     train_loadings$Disgust) 
+# F1 score on test set
+f1_reg_loadings_test <- F1_Score(pred_reg_loadings_test, 
+                                    test_loadings$Disgust) 
+
+
+# Print results
+# Train set
+print(accuracy_reg_loadings_train)
+print(recall_reg_loadings_train) 
+print(f1_reg_loadings_train)
+
+# Test set
+print(accuracy_reg_loadings_test)
+print(recall_reg_loadings_test) 
+print(f1_reg_loadings_test)
+
+
+
+
+#Logistic regression algorithmic features
+# Train regression model
+reg_algorithmic <- glm(train_algorithmic$`features$Disgust` ~ ., data = train_algorithmic[,-1], family = binomial)
+
+# Print model summary
+summary(reg_algorithmic)
+
+# Predict on train set 
+pred_reg_algorithmic_probabilities_train <- predict(reg_algorithmic, newdata = train_algorithmic[, -1], type = "response")
+
+# Predict on test set 
+pred_reg_algorithmic_probabilities_test <- predict(reg_algorithmic, newdata = test_algorithmic[, -1], type = "response")
+
+# Convert predicted probabilities for train set to predicted class labels
+pred_reg_algorithmic_train <- ifelse(pred_reg_algorithmic_probabilities_train > 0.5, 1, 0)
+
+# Convert predicted probabilities for test set to predicted class labels
+pred_reg_algorithmic_test <- ifelse(pred_reg_algorithmic_probabilities_test > 0.5, 1, 0)
+
+
+# Accuracy on train set
+accuracy_reg_algorithmic_train <- Accuracy(pred_reg_algorithmic_train, 
+                                        train_algorithmic$`features$Disgust`) 
+# Accuracy on test set
+accuracy_reg_algorithmic_test <- Accuracy(pred_reg_loadings_test, 
+                                       test_algorithmic$`features$Disgust`) 
+# Recall on train set
+recall_reg_algorithmic_train <- Recall(pred_reg_loadings_train, 
+                                    train_algorithmic$`features$Disgust`) 
+
+# Recall on test set
+recall_reg_algorithmic_test <- Recall(pred_reg_algorithmic_test, 
+                                   test_algorithmic$`features$Disgust`) 
+# F1 score on train set
+f1_reg_algorithmic_train <- F1_Score(pred_reg_algorithmic_train, 
+                                  train_algorithmic$`features$Disgust`) 
+# F1 score on test set
+f1_reg_algorithmic_test <- F1_Score(pred_reg_algorithmic_test, 
+                                 test_algorithmic$`features$Disgust`) 
+
+
+# Print results
+# Train set
+print(accuracy_reg_loadings_train)
+print(recall_reg_loadings_train) 
+print(f1_reg_loadings_train)
+
+# Test set
+print(accuracy_reg_loadings_test)
+print(recall_reg_loadings_test) 
+print(f1_reg_loadings_test)
+
+
+
+
+
+# Third model: random Forest
+library(randomForest)
+
+
+# Fit a Random Forest model on all features
+rf_model <- randomForest(Disgust ~ ., data = train_data, ntree = 100, importance = TRUE)
+
+# Print model summary
+print(rf_model)
+
+
+# Make predictions on the same dataset
+pred_rf_allfeatures_probabilities_train <- predict(rf_model, train_data, type = "response")
+
+# Make predictions on the same dataset
+pred_rf_allfeatures_probabilities_test <- predict(rf_model, test_data, type = "response")
+
+# Convert predicted probabilities for train set to predicted class labels
+pred_rf_allfeatures_train <- ifelse(pred_rf_allfeatures_probabilities_train > 0.5, 1, 0)
+
+# Convert predicted probabilities for test set to predicted class labels
+pred_rf_allfeatures_test <- ifelse(pred_rf_allfeatures_probabilities_test > 0.5, 1, 0)
+
+
+# Accuracy on train set
+accuracy_rf_allfeatures_train <- Accuracy(pred_rf_allfeatures_train, 
+                                          train_data$Disgust) 
+# Accuracy on test set
+accuracy_rf_allfeatures_test <- Accuracy(pred_rf_allfeatures_test, 
+                                         test_data$Disgust) 
+
+# Recall on train set
+recall_rf_allfeatures_train <- Recall(pred_rf_allfeatures_train, 
+                                      train_data$Disgust) 
+# Recall on test set
+recall_rf_allfeatures_test <- Recall(pred_rf_allfeatures_test, 
+                                     test_data$Disgust) 
+
+# F1 score on train set
+f1_rf_allfeatures_train <- F1_Score(pred_rf_allfeatures_train, 
+                                    train_data$Disgust) 
+# F1 score on test set
+f1_rf_allfeatures_test <- F1_Score(pred_rf_allfeatures_test, 
+                                   test_data$Disgust) 
+
+
+# Print results
+# Train set
+print(accuracy_rf_allfeatures_train)
+print(recall_rf_allfeatures_train) 
+print(f1_rf_allfeatures_train)
+
+# Test set
+print(accuracy_rf_allfeatures_test)
+print(recall_rf_allfeatures_test) 
+print(f1_rf_allfeatures_test)
+
+
+
+
+
+
+# Fit a Random Forest model on loadings
+rf_model_loadings <- randomForest(Disgust ~ ., data = train_loadings, ntree = 100, importance = TRUE)
+
+# Print model summary
+print(rf_model_loadings)
+
+
+# Make predictions on the same dataset
+pred_rf_loadings_probabilities_train <- predict(rf_model_loadings, train_loadings, type = "response")
+
+# Make predictions on the same dataset
+pred_rf_loadings_probabilities_test <- predict(rf_model_loadings, test_loadings, type = "response")
+
+# Convert predicted probabilities for train set to predicted class labels
+pred_rf_loadings_train <- ifelse(pred_rf_loadings_probabilities_train > 0.5, 1, 0)
+
+# Convert predicted probabilities for test set to predicted class labels
+pred_rf_loadings_test <- ifelse(pred_rf_loadings_probabilities_test > 0.5, 1, 0)
+
+
+# Accuracy on train set
+accuracy_rf_loadings_train <- Accuracy(pred_rf_loadings_train, 
+                                          train_loadings$Disgust) 
+# Accuracy on test set
+accuracy_rf_loadings_test <- Accuracy(pred_rf_loadings_test, 
+                                         test_loadings$Disgust) 
+
+# Recall on train set
+recall_rf_loadings_train <- Recall(pred_rf_loadings_train, 
+                                      train_loadings$Disgust) 
+# Recall on test set
+recall_rf_loadings_test <- Recall(pred_rf_loadings_test, 
+                                     test_loadings$Disgust) 
+
+# F1 score on train set
+f1_rf_loadings_train <- F1_Score(pred_rf_loadings_train, 
+                                    train_loadings$Disgust) 
+# F1 score on test set
+f1_rf_loadings_test <- F1_Score(pred_rf_loadings_test, 
+                                   test_loadings$Disgust) 
+
+
+# Print results
+# Train set
+print(accuracy_rf_loadings_train)
+print(recall_rf_loadings_train) 
+print(f1_rf_loadings_train)
+
+# Test set
+print(accuracy_rf_loadings_test)
+print(recall_rf_loadings_test) 
+print(f1_rf_loadings_test)
+
+
+
+
+
+
+
+# Fit a Random Forest model on loadings
+rf_model_algorithmic <- randomForest(train_algorithmic$`features$Disgust` ~ ., data = train_algorithmic, ntree = 100, importance = TRUE)
+
+# Print model summary
+print(rf_model_algorithmic)
+
+
+# Make predictions on the same dataset
+pred_rf_algorithmic_probabilities_train <- predict(rf_model_algorithmic, train_algorithmic, type = "response")
+
+# Make predictions on the same dataset
+pred_rf_algorithmic_probabilities_test <- predict(rf_model_algorithmic, test_algorithmic, type = "response")
+
+# Convert predicted probabilities for train set to predicted class labels
+pred_rf_algorithmic_train <- ifelse(pred_rf_algorithmic_probabilities_train > 0.5, 1, 0)
+
+# Convert predicted probabilities for test set to predicted class labels
+pred_rf_algorithmic_test <- ifelse(pred_rf_algorithmic_probabilities_test > 0.5, 1, 0)
+
+
+# Accuracy on train set
+accuracy_rf_algorithmic_train <- Accuracy(pred_rf_algorithmic_train, 
+                                       train_algorithmic$`features$Disgust`) 
+# Accuracy on test set
+accuracy_rf_algorithmic_test <- Accuracy(pred_rf_algorithmic_test, 
+                                      test_algorithmic$`features$Disgust`) 
+
+# Recall on train set
+recall_rf_algorithmic_train <- Recall(pred_rf_algorithmic_train, 
+                                   train_algorithmic$`features$Disgust`) 
+# Recall on test set
+recall_rf_algorithmic_test <- Recall(pred_rf_algorithmic_test, 
+                                  test_algorithmic$`features$Disgust`) 
+
+# F1 score on train set
+f1_rf_algorithmic_train <- F1_Score(pred_rf_algorithmic_train, 
+                                 train_algorithmic$`features$Disgust`) 
+# F1 score on test set
+f1_rf_algorithmic_test <- F1_Score(pred_rf_algorithmic_test, 
+                                test_algorithmic$`features$Disgust`) 
+
+
+# Print results
+# Train set
+print(accuracy_rf_algorithmic_train)
+print(recall_rf_algorithmic_train) 
+print(f1_rf_algorithmic_train)
+
+# Test set
+print(accuracy_rf_algorithmic_test)
+print(recall_rf_algorithmic_test) 
+print(f1_rf_algorithmic_test)
+
+
+
+
+
+#RESULTS TABLES
+# Store the objects in vectors
+
+# For results of svms
+allfeatures_svm <- c(accuracy_svm_allfeatures, recall_svm_allfeatures, f1_svm_allfeatures, accuracy_svm_allfeatures_test, recall_svm_allfeatures_test, f1_svm_allfeatures_test)
+
+loadings_svm <- c(accuracy_svm_loadings, recall_svm_loadings, f1_svm_loadings,
+                  accuracy_svm_loadings_test, recall_svm_loadings_test, f1_svm_loadings_test)
+
+algorithmic_svm <- c(accuracy_svm_algorithmic_train, recall_svm_algorithmic_train, f1_svm_algorithmic_train, accuracy_svm_algorithmic, recall_svm_algorithmic, f1_svm_algorithmic)
+
+# For results of regressions
+allfeatures_reg <- c(accuracy_reg_allfeatures_train, recall_reg_allfeatures_train, f1_reg_allfeatures_train, accuracy_reg_allfeatures_test, recall_reg_allfeatures_test, f1_reg_allfeatures_test)
+
+loadings_reg <- c(accuracy_reg_loadings_train, recall_reg_loadings_train, f1_reg_loadings_train,
+                  accuracy_reg_loadings_test, recall_reg_loadings_test, f1_reg_loadings_test)
+
+algorithmic_reg <- c(accuracy_reg_algorithmic_train, recall_reg_algorithmic_train, f1_reg_algorithmic_train, accuracy_reg_algorithmic_test, recall_reg_algorithmic_test, f1_reg_algorithmic_test)
+
+# For results of random forests
+allfeatures_rf <- c(accuracy_rf_allfeatures_train, recall_rf_allfeatures_train, f1_rf_allfeatures_train, accuracy_rf_allfeatures_test, recall_rf_allfeatures_test, f1_rf_allfeatures_test)
+
+loadings_rf <- c(accuracy_rf_loadings_train, recall_rf_loadings_train, f1_rf_loadings_train,
+                 accuracy_rf_loadings_test, recall_rf_loadings_test, f1_rf_loadings_test)
+
+algorithmic_rf <- c(accuracy_rf_algorithmic_train, recall_rf_algorithmic_train, f1_rf_algorithmic_train, accuracy_rf_algorithmic_test, recall_rf_algorithmic_test, f1_rf_algorithmic_test)
+
+
+# Storing results to data frames for each classifier
+svm_results <- data.frame(allfeatures_svm, loadings_svm, algorithmic_svm)
+regression_results <- data.frame(allfeatures_reg, loadings_reg, algorithmic_reg)
+rforest_results <- data.frame(allfeatures_rf, loadings_rf, algorithmic_rf)
+
+# Rounding the results
+svm_results <- round(svm_results, digits = 2)
+regression_results <- round(regression_results, digits = 2)
+rforest_results <- round(rforest_results, digits = 2)
+
+# Labeling rows
+rowlabels <- c("Accuracy_train", "Recall_train", "F1-score_train", "Accuracy_test", "Recall_test", "F1-score_test")
+
+row.names(svm_results) <- rowlabels
+row.names(regression_results) <- rowlabels
+row.names(rforest_results) <- rowlabels
+
+# Combining all results
+results <- cbind(svm_results, regression_results, rforest_results)
+
